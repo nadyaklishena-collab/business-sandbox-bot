@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -16,51 +17,55 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     Filters,
-    CallbackContext,
     ConversationHandler,
+    CallbackContext,
 )
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ---- ЛОГИ ----
+# ---------------- ЛОГИ ----------------
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ---- СТАНИ ДЛЯ CONVERSATION HANDLER ----
+# ---------------- СТАНИ ----------------
+
 (
-    WAIT_START,
-    POLICY,
     LANGUAGE,
+    CONSENT,
     NAME,
-    PHONE,
+    PHONE_METHOD,
     PHONE_MANUAL,
     CITY,
     FIELD,
     EXPERIENCE,
-) = range(9)
+) = range(8)
 
-# ---- ЗАГРУЗКА НАСТРОЕК ИЗ .env ----
+# ---------------- НАСТРОЙКИ ----------------
+
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+)
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Registrations")
 
-# Гиперссылка на политику (HTML)
-POLICY_URL = (
-    "https://docs.google.com/document/d/1zeC9FBAj3XRQ0PwPcIRZJ5CSQnTh2AjH8pvB599RMO8/edit"
-)
+PRIVACY_URL = "https://docs.google.com/document/d/1zeC9FBAj3XRQ0PwPcIRZJ5CSQnTh2AjH8pvB599RMO8/edit?tab=t.0"
 
 if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN / BOT_TOKEN не знайдено в .env")
+    raise RuntimeError("BOT_TOKEN / TELEGRAM_BOT_TOKEN не найден в .env")
 if not SPREADSHEET_ID:
-    raise RuntimeError("SPREADSHEET_ID не знайдено в .env")
+    raise RuntimeError("SPREADSHEET_ID не найден в .env")
+
+# ---------------- GOOGLE SHEETS ----------------
 
 
-# ---- GOOGLE SHEETS ----
 def init_sheet():
     scope = [
         "https://spreadsheets.google.com/feeds",
@@ -75,411 +80,477 @@ def init_sheet():
 
 sheet = init_sheet()
 
-
-def append_row(data: dict):
-    """
-    Додаємо рядок у Google Sheets відповідно до структури:
-
-    timestamp	user_id	username	first_name	segment	name	phone	city	field	experience	source
-    """
-    try:
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-        row = [
-            timestamp,                   # timestamp
-            data.get("user_id", ""),     # user_id
-            data.get("username", ""),    # username
-            data.get("first_name", ""),  # first_name
-            data.get("lang", ""),        # segment (ua/ru)
-            data.get("name", ""),        # name
-            data.get("phone", ""),       # phone
-            data.get("city", ""),        # city
-            data.get("field", ""),       # field
-            data.get("experience", ""),  # experience
-            "telegram",                  # source
-        ]
-
-        sheet.append_row(row)
-
-    except Exception as e:
-        logger.exception(f"Помилка запису в Google Sheets: {e}")
+# ---------------- ТЕКСТЫ ----------------
 
 
-# ---- ТЕКСТИ ----
-
-WELCOME_UA = (
-    "Привіт! 👋\n"
-    "Ми запускаємо Business Sandbox — безкоштовну бізнес-школу для українців в Орхусі.\n"
-    "(навчання українською або російською мовами)\n\n"
-    "Ми проводимо попередній запис на перший потік, де Ви зможете отримати практичні знання про:\n\n"
-    "• датське законодавство\n"
-    "• податки\n"
-    "• маркетинг\n"
-    "• ділову датську мову\n"
-    "та багато іншого ✨\n\n"
-    "А ще — безпечно протестувати свою бізнес-ідею ⭐️\n\n"
-    "Щоб почати — натисніть кнопку «Старт»."
-)
-
-POLICY_UA = (
-    "Перш ніж ми почнемо 😊\n\n"
-    "Натискаючи «Почати» та продовжуючи реєстрацію, Ви погоджуєтеся на обробку Ваших "
-    "персональних даних (ім’я, телефон, місто, сфера діяльності).\n\n"
-    "Ці дані використовуються для зв'язку з Вами щодо участі в проєкті.\n\n"
-    "Ваші дані можуть бути видалені за Вашим зверненням.\n\n"
-    'Повна версія політики та згоди: <a href="{url}">прочитати тут</a>.'
-)
-
-LANG_CHOICE = "Будь ласка, оберіть мову спілкування:"
-LANG_KB = [["🇺🇦 Українська"], ["🇷🇺 Русский"]]
+def t(key: str, lang: str) -> str:
+    return TEXTS[key][lang]
 
 
-def is_ua(lang: str) -> bool:
-    return lang == "ua"
+TEXTS = {
+    "lang_choose": {
+        "uk": "Оберіть мову / Выберите язык:",
+        "ru": "Оберите язык / Выберите язык:",
+    },
+    "welcome": {
+        "uk": (
+            "Привіт! 👋\n\n"
+            "Це реєстраційний бот Business Sandbox Aarhus.\n"
+            "Щоб почати — натисніть кнопку «Почати»."
+        ),
+        "ru": (
+            "Привет! 👋\n\n"
+            "Это регистрационный бот Business Sandbox Aarhus.\n"
+            "Чтобы начать — нажмите кнопку «Начать»."
+        ),
+    },
+    "policy": {
+        "uk": (
+            "Перш ніж ми почнемо 😊\n\n"
+            "Натискаючи «Погоджуюсь» та продовжуючи реєстрацію, "
+            "Ви погоджуєтеся на обробку Ваших персональних даних "
+            "(ім’я, телефон, місто, сфера діяльності).\n\n"
+            "Ці дані використовуються для зв'язку з Вами щодо участі в проєкті.\n"
+            "Ваші дані можуть бути видалені за Вашим зверненням.\n\n"
+            f"Повна версія політики та згоди: "
+            f'<a href="{PRIVACY_URL}">прочитати тут</a>.'
+        ),
+        "ru": (
+            "Прежде чем мы начнём 😊\n\n"
+            "Нажимая «Согласен» и продолжая регистрацию, "
+            "Вы соглашаетесь на обработку Ваших персональных данных "
+            "(имя, телефон, город, сфера деятельности).\n\n"
+            "Эти данные используются для связи с Вами по участию в проекте.\n"
+            "Ваши данные могут быть удалены по Вашему запросу.\n\n"
+            f"Полная версия политики и согласия: "
+            f'<a href="{PRIVACY_URL}">прочитать здесь</a>.'
+        ),
+    },
+    "no_consent": {
+        "uk": (
+            "Дякуємо! Без згоди на обробку даних ми не можемо продовжити реєстрацію.\n\n"
+            "Якщо передумаєте — надішліть /start і почніть заново."
+        ),
+        "ru": (
+            "Благодарим! Без согласия на обработку данных мы не можем продолжить регистрацию.\n\n"
+            "Если передумаете — отправьте /start и начните заново."
+        ),
+    },
+    "ask_name": {
+        "uk": "Як Вас звати? 🙂\nНапишіть, будь ласка, Ваше ім’я.",
+        "ru": "Как Вас зовут? 🙂\nПожалуйста, напишите Ваше имя.",
+    },
+    "ask_phone_method": {
+        "uk": "Як зручніше залишити номер телефону? 📱",
+        "ru": "Как удобнее оставить номер телефона? 📱",
+    },
+    "ask_phone_manual": {
+        "uk": (
+            "Введіть, будь ласка, номер телефону у міжнародному форматі.\n"
+            "Наприклад: +45 12345678 або +380 991234567"
+        ),
+        "ru": (
+            "Пожалуйста, введите номер телефона в международном формате.\n"
+            "Например: +45 12345678 или +380 991234567"
+        ),
+    },
+    "phone_invalid": {
+        "uk": (
+            "Номер виглядає некоректним 🤔\n"
+            "Будь ласка, введіть номер у форматі +КОД_КРАЇНИ і тільки цифри.\n"
+            "Наприклад: +45 12345678 або +380 991234567."
+        ),
+        "ru": (
+            "Похоже, в номере есть ошибка 🤔\n"
+            "Пожалуйста, введите номер в формате +КОД_СТРАНЫ и только цифры.\n"
+            "Например: +45 12345678 или +380 991234567."
+        ),
+    },
+    "ask_city": {
+        "uk": "З якого Ви міста? 🏙",
+        "ru": "Из какого Вы города? 🏙",
+    },
+    "ask_field": {
+        "uk": "У якій сфері Ви плануєте або хотіли б працювати? 👇",
+        "ru": "В какой сфере Вы планируете или хотели бы работать? 👇",
+    },
+    "ask_experience": {
+        "uk": "Чи є у Вас досвід у цій сфері? 🙂",
+        "ru": "Есть ли у Вас опыт в этой сфере? 🙂",
+    },
+    "choose_button": {
+        "uk": "Будь ласка, скористайтеся кнопками нижче 👇",
+        "ru": "Пожалуйста, используйте кнопки ниже 👇",
+    },
+    "final": {
+        "uk": (
+            "Дякуємо Вам за реєстрацію! 😊\n\n"
+            "Ми зв'яжемося з Вами у березні, перед запуском школи, "
+            "або раніше — якщо строки зміняться.\n\n"
+            "Якщо Ваша інформація до того часу зміниться, Ви можете пройти "
+            "реєстрацію ще раз, надіславши /start."
+        ),
+        "ru": (
+            "Благодарим Вас за регистрацию! 😊\n\n"
+            "Мы свяжемся с Вами в марте, перед запуском школы, "
+            "или раньше — если сроки изменятся.\n\n"
+            "Если Ваша информация к тому моменту изменится, Вы можете пройти "
+            "регистрацию ещё раз, отправив /start."
+        ),
+    },
+}
+
+LANG_BUTTONS = [["Українська"], ["Русский"]]
+
+START_BUTTONS = {
+    "uk": [["Почати"]],
+    "ru": [["Начать"]],
+}
+
+POLICY_BUTTONS = {
+    "uk": [["Погоджуюсь"], ["Не погоджуюсь"]],
+    "ru": [["Согласен"], ["Не согласен"]],
+}
+
+PHONE_BUTTONS = {
+    "uk": [
+        [KeyboardButton("Надіслати номер з Telegram", request_contact=True)],
+        ["Ввести номер вручну"],
+    ],
+    "ru": [
+        [KeyboardButton("Отправить номер из Telegram", request_contact=True)],
+        ["Ввести номер вручную"],
+    ],
+}
+
+FIELD_BUTTONS = {
+    "uk": [
+        ["Клінінг"],
+        ["Ресторанний бізнес"],
+        ["Бʼюті / краса"],
+        ["Інше"],
+    ],
+    "ru": [
+        ["Клининг"],
+        ["Ресторанный бизнес"],
+        ["Бьюти / красота"],
+        ["Другое"],
+    ],
+}
+
+EXP_BUTTONS = {
+    "uk": [
+        ["Так, є"],
+        ["Трохи"],
+        ["Ні, починаю з нуля"],
+    ],
+    "ru": [
+        ["Да, есть"],
+        ["Немного"],
+        ["Нет, начинаю с нуля"],
+    ],
+}
+
+PHONE_REGEX = re.compile(r"^(\+45\d{8}|\+380\d{9})$")
 
 
-def clean_text(text: str) -> str:
-    return (text or "").strip()
+def get_lang(context: CallbackContext) -> str:
+    return context.user_data.get("lang", "uk")
 
 
-# ---- ОБРАБОТЧИКИ ----
+def map_segment(experience: str, lang: str) -> str:
+    uk_map = {
+        "Так, є": "есть опыт",
+        "Трохи": "немного опыта",
+        "Ні, починаю з нуля": "начинаю с нуля",
+    }
+    ru_map = {
+        "Да, есть": "есть опыт",
+        "Немного": "немного опыта",
+        "Нет, начинаю с нуля": "начинаю с нуля",
+    }
+    if lang == "uk":
+        return uk_map.get(experience, "")
+    return ru_map.get(experience, "")
+
+
+def normalize_phone(raw: str) -> str:
+    s = raw.replace(" ", "")
+    if not s.startswith("+"):
+        s = "+" + "".join(ch for ch in s if ch.isdigit())
+    else:
+        s = "+" + "".join(ch for ch in s[1:] if ch.isdigit())
+    return s
+
+
+# ---------------- ОБРАБОТЧИКИ ----------------
+
 
 def start(update: Update, context: CallbackContext) -> int:
-    """Початок розмови, показуємо привітання і кнопку Старт."""
-    user = update.effective_user
-    logger.info("Start by %s", user.id if user else "unknown")
-
+    """Команда /start или текст 'Старт' / 'Начать' — выбор языка."""
     context.user_data.clear()
-
-    kb = [["Старт"]]
-    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
-
-    update.message.reply_text(WELCOME_UA, reply_markup=reply_markup)
-    return WAIT_START
-
-
-def wait_start(update: Update, context: CallbackContext) -> int:
-    """Чекаємо натискання Старт. Будь-який інший текст не приймається."""
-    text = clean_text(update.message.text)
-
-    if text != "Старт":
-        update.message.reply_text("Щоб розпочати, натисніть, будь ласка, кнопку «Старт».")
-        return WAIT_START
-
-    kb = [["Погоджуюсь"], ["Не погоджуюсь"]]
-    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
-
+    kb = ReplyKeyboardMarkup(LANG_BUTTONS, resize_keyboard=True, one_time_keyboard=True)
     update.message.reply_text(
-        POLICY_UA.format(url=POLICY_URL),
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
+        TEXTS["lang_choose"]["uk"], reply_markup=kb
     )
-    return POLICY
-
-
-def policy_handler(update: Update, context: CallbackContext) -> int:
-    """Обробка згоди / незгоди з політикою. Тут тільки кнопки."""
-    text = clean_text(update.message.text)
-
-    if text == "Погоджуюсь":
-        reply_markup = ReplyKeyboardMarkup(
-            LANG_KB, resize_keyboard=True, one_time_keyboard=True
-        )
-        update.message.reply_text(LANG_CHOICE, reply_markup=reply_markup)
-        return LANGUAGE
-
-    if text == "Не погоджуюсь":
-        kb = [["Старт"]]
-        reply_markup = ReplyKeyboardMarkup(
-            kb, resize_keyboard=True, one_time_keyboard=True
-        )
-        update.message.reply_text(
-            "Дякуємо! Без згоди на обробку даних ми не можемо продовжити реєстрацію.\n\n"
-            "Якщо передумаєте — натисніть «Старт» і почніть заново.",
-            reply_markup=reply_markup,
-        )
-        return WAIT_START
-
-    # Жорстко: тільки кнопки
-    update.message.reply_text(
-        "Будь ласка, оберіть один із варіантів: «Погоджуюсь» або «Не погоджуюсь» за допомогою кнопок."
-    )
-    return POLICY
+    return LANGUAGE
 
 
 def language_handler(update: Update, context: CallbackContext) -> int:
-    """Вибір мови. Тільки кнопки 🇺🇦 або 🇷🇺."""
-    text = clean_text(update.message.text)
-
-    if text == "🇺🇦 Українська":
-        context.user_data["lang"] = "ua"
-    elif text == "🇷🇺 Русский":
-        context.user_data["lang"] = "ru"
+    text = (update.message.text or "").strip()
+    if text == "Українська":
+        lang = "uk"
+    elif text == "Русский":
+        lang = "ru"
     else:
-        update.message.reply_text("Будь ласка, оберіть мову за допомогою кнопок.")
+        kb = ReplyKeyboardMarkup(LANG_BUTTONS, resize_keyboard=True, one_time_keyboard=True)
+        update.message.reply_text(TEXTS["lang_choose"]["uk"], reply_markup=kb)
         return LANGUAGE
 
-    lang = context.user_data["lang"]
-    user = update.effective_user
+    context.user_data["lang"] = lang
 
-    if user:
-        context.user_data["user_id"] = user.id
-        context.user_data["username"] = user.username or ""
-        context.user_data["first_name"] = user.first_name or ""
+    kb = ReplyKeyboardMarkup(
+        START_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
+    )
+    update.message.reply_text(TEXTS["welcome"][lang], reply_markup=kb)
+    return CONSENT
 
-    # Далі вже текстовий ввід ІМЕНІ дозволений
-    if is_ua(lang):
-        update.message.reply_text(
-            "Як Вас звати? (Напишіть Ваше ім'я текстом)", reply_markup=ReplyKeyboardRemove()
+
+def consent_handler(update: Update, context: CallbackContext) -> int:
+    lang = get_lang(context)
+    text = (update.message.text or "").strip()
+
+    start_text = "Почати" if lang == "uk" else "Начать"
+
+    if text != start_text:
+        kb = ReplyKeyboardMarkup(
+            START_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
         )
-    else:
-        update.message.reply_text(
-            "Как Вас зовут? (Напишите Ваше имя текстом)", reply_markup=ReplyKeyboardRemove()
-        )
+        update.message.reply_text(TEXTS["welcome"][lang], reply_markup=kb)
+        return CONSENT
 
+    kb = ReplyKeyboardMarkup(
+        POLICY_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
+    )
+    update.message.reply_text(
+        TEXTS["policy"][lang],
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
     return NAME
 
 
 def name_handler(update: Update, context: CallbackContext) -> int:
-    """Зберігаємо ім'я, питаємо телефон (кнопка/вручну). Тут текст дозволений."""
-    lang = context.user_data.get("lang", "ua")
-    name = clean_text(update.message.text)
-    if not name:
-        if is_ua(lang):
-            update.message.reply_text("Будь ласка, введіть Ваше ім'я текстом.")
-        else:
-            update.message.reply_text("Пожалуйста, введите Ваше имя текстом.")
+    lang = get_lang(context)
+    text = (update.message.text or "").strip()
+
+    agree = "Погоджуюсь" if lang == "uk" else "Согласен"
+    disagree = "Не погоджуюсь" if lang == "uk" else "Не согласен"
+
+    if text == disagree:
+        update.message.reply_text(
+            TEXTS["no_consent"][lang], reply_markup=ReplyKeyboardRemove()
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if text == agree:
+        update.message.reply_text(
+            TEXTS["ask_name"][lang],
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return NAME
 
-    context.user_data["name"] = name
+    # считаем, что это уже введённое имя
+    if not text:
+        update.message.reply_text(TEXTS["ask_name"][lang])
+        return NAME
 
-    if is_ua(lang):
-        share_btn = KeyboardButton("📱 Поділитися контактом", request_contact=True)
-        manual_btn = KeyboardButton("📞 Ввести номер вручну")
-        text = (
-            "Будь ласка, поділіться Вашим номером телефону.\n\n"
-            "Можете натиснути «📱 Поділитися контактом» або «📞 Ввести номер вручну»."
-        )
-    else:
-        share_btn = KeyboardButton("📱 Поделиться контактом", request_contact=True)
-        manual_btn = KeyboardButton("📞 Ввести номер вручную")
-        text = (
-            "Пожалуйста, поделитесь Вашим номером телефона.\n\n"
-            "Можете нажать «📱 Поделиться контактом» или «📞 Ввести номер вручную»."
-        )
+    context.user_data["name"] = text
 
-    reply_markup = ReplyKeyboardMarkup(
-        [[share_btn], [manual_btn]], resize_keyboard=True, one_time_keyboard=True
+    kb = ReplyKeyboardMarkup(
+        PHONE_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
     )
+    update.message.reply_text(
+        TEXTS["ask_phone_method"][lang],
+        reply_markup=kb,
+    )
+    return PHONE_METHOD
 
-    update.message.reply_text(text, reply_markup=reply_markup)
-    return PHONE
 
+def phone_method_handler(update: Update, context: CallbackContext) -> int:
+    lang = get_lang(context)
+    msg = update.message
 
-def phone_handler(update: Update, context: CallbackContext) -> int:
-    """
-    Отримуємо телефон:
-    - або контакт (request_contact),
-    - або переходимо до ручного вводу за кнопкою.
-    Будь-який інший текст відхиляємо.
-    """
-    lang = context.user_data.get("lang", "ua")
-
-    # Вариант 1: отправили контакт
-    if update.message.contact:
-        phone = update.message.contact.phone_number
-        context.user_data["phone"] = phone
-
-        if is_ua(lang):
-            update.message.reply_text(
-                "Дякуємо! 🙌\n\nВ якому місті Ви зараз проживаєте?",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        else:
-            update.message.reply_text(
-                "Спасибо! 🙌\n\nВ каком городе Вы сейчас живёте?",
-                reply_markup=ReplyKeyboardRemove(),
-            )
+    if msg.contact:
+        phone = msg.contact.phone_number
+        context.user_data["phone"] = normalize_phone(phone)
+        update.message.reply_text(
+            TEXTS["ask_city"][lang], reply_markup=ReplyKeyboardRemove()
+        )
         return CITY
 
-    # Вариант 2: натиснули кнопку "Ввести номер вручну"
-    text = clean_text(update.message.text)
+    text = (msg.text or "").strip()
 
-    if is_ua(lang) and text == "📞 Ввести номер вручну":
+    manual = "Ввести номер вручну" if lang == "uk" else "Ввести номер вручную"
+    send = (
+        "Надіслати номер з Telegram"
+        if lang == "uk"
+        else "Отправить номер из Telegram"
+    )
+
+    if text == manual:
         update.message.reply_text(
-            "Будь ласка, введіть Ваш номер у форматі +45 00 00 00 00.",
+            TEXTS["ask_phone_manual"][lang],
             reply_markup=ReplyKeyboardRemove(),
         )
         return PHONE_MANUAL
 
-    if not is_ua(lang) and text == "📞 Ввести номер вручную":
-        update.message.reply_text(
-            "Пожалуйста, введите Ваш номер в формате +45 00 00 00 00.",
-            reply_markup=ReplyKeyboardRemove(),
+    if text == send:
+        # нажали кнопку, но не отправили контакт
+        kb = ReplyKeyboardMarkup(
+            PHONE_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
         )
-        return PHONE_MANUAL
+        update.message.reply_text(TEXTS["choose_button"][lang], reply_markup=kb)
+        return PHONE_METHOD
 
-    # Інший текст не приймаємо — тільки кнопки
-    if is_ua(lang):
-        update.message.reply_text(
-            "Будь ласка, скористайтеся кнопками: «📱 Поділитися контактом» "
-            "або «📞 Ввести номер вручну»."
-        )
-    else:
-        update.message.reply_text(
-            "Пожалуйста, используйте кнопки: «📱 Поделиться контактом» "
-            "или «📞 Ввести номер вручную»."
-        )
-    return PHONE
+    # любой другой текст
+    kb = ReplyKeyboardMarkup(
+        PHONE_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
+    )
+    update.message.reply_text(TEXTS["choose_button"][lang], reply_markup=kb)
+    return PHONE_METHOD
 
 
 def phone_manual_handler(update: Update, context: CallbackContext) -> int:
-    """Ручний ввід номера телефону. Тут текст дозволений, але з перевіркою."""
-    lang = context.user_data.get("lang", "ua")
-    phone = clean_text(update.message.text)
+    lang = get_lang(context)
+    raw = (update.message.text or "").strip()
+    phone_clean = normalize_phone(raw)
 
-    digits = [c for c in phone if c.isdigit()]
-    if not phone.startswith("+") or len(digits) < 8:
-        if is_ua(lang):
-            update.message.reply_text(
-                "Схоже, номер у некоректному форматі.\n"
-                "Приклад: +45 00 00 00 00\n"
-                "Спробуйте, будь ласка, ще раз."
-            )
-        else:
-            update.message.reply_text(
-                "Похоже, номер в неверном формате.\n"
-                "Пример: +45 00 00 00 00\n"
-                "Попробуйте, пожалуйста, ещё раз."
-            )
+    if not PHONE_REGEX.match(phone_clean):
+        update.message.reply_text(TEXTS["phone_invalid"][lang])
         return PHONE_MANUAL
 
-    context.user_data["phone"] = phone
-
-    if is_ua(lang):
-        update.message.reply_text(
-            "Дякуємо! 🙌\n\nВ якому місті Ви зараз проживаєте?",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    else:
-        update.message.reply_text(
-            "Спасибо! 🙌\n\nВ каком городе Вы сейчас живёте?",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+    context.user_data["phone"] = phone_clean
+    update.message.reply_text(TEXTS["ask_city"][lang])
     return CITY
 
 
 def city_handler(update: Update, context: CallbackContext) -> int:
-    """Отримуємо місто. Тут текст дозволений."""
-    lang = context.user_data.get("lang", "ua")
-    city = clean_text(update.message.text)
+    lang = get_lang(context)
+    city = (update.message.text or "").strip()
     if not city:
-        if is_ua(lang):
-            update.message.reply_text("Будь ласка, напишіть назву міста текстом.")
-        else:
-            update.message.reply_text("Пожалуйста, напишите название города текстом.")
+        update.message.reply_text(TEXTS["ask_city"][lang])
         return CITY
 
     context.user_data["city"] = city
 
-    # Далі тільки кнопки по сферам
-    if is_ua(lang):
-        kb = [["Б'юті", "Ресторанний бізнес"], ["Клінінг", "Інше"]]
-        text = "У якій сфері Ви плануєте або хотіли б працювати?"
-    else:
-        kb = [["Бьюти", "Ресторанный бизнес"], ["Клининг", "Другое"]]
-        text = "В какой сфере Вы планируете или хотели бы работать?"
-
-    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
-    update.message.reply_text(text, reply_markup=reply_markup)
+    kb = ReplyKeyboardMarkup(
+        FIELD_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
+    )
+    update.message.reply_text(TEXTS["ask_field"][lang], reply_markup=kb)
     return FIELD
 
 
 def field_handler(update: Update, context: CallbackContext) -> int:
-    """
-    Отримуємо сферу.
-    ТУТ ЖОРСТКО: тільки кнопки, свої варіанти не приймаємо.
-    """
-    lang = context.user_data.get("lang", "ua")
-    field = clean_text(update.message.text)
+    lang = get_lang(context)
+    text = (update.message.text or "").strip()
 
-    if is_ua(lang):
-        allowed = ["Б'юті", "Ресторанний бізнес", "Клінінг", "Інше"]
-        error_text = "Будь ласка, оберіть сферу за допомогою кнопок."
-    else:
-        allowed = ["Бьюти", "Ресторанный бизнес", "Клининг", "Другое"]
-        error_text = "Пожалуйста, выберите сферу с помощью кнопок."
+    allowed_rows = FIELD_BUTTONS[lang]
+    allowed = [item for row in allowed_rows for item in row]
 
-    if field not in allowed:
-        update.message.reply_text(error_text)
+    if text not in allowed:
+        kb = ReplyKeyboardMarkup(
+            FIELD_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
+        )
+        update.message.reply_text(TEXTS["choose_button"][lang], reply_markup=kb)
         return FIELD
 
-    context.user_data["field"] = field
+    context.user_data["field"] = text
 
-    if is_ua(lang):
-        kb = [["Так", "Ні"]]
-        text = "Чи є у Вас досвід в цій сфері?"
-    else:
-        kb = [["Да", "Нет"]]
-        text = "Есть ли у Вас опыт в этой сфере?"
-
-    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
-    update.message.reply_text(text, reply_markup=reply_markup)
+    kb = ReplyKeyboardMarkup(
+        EXP_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
+    )
+    update.message.reply_text(TEXTS["ask_experience"][lang], reply_markup=kb)
     return EXPERIENCE
 
 
 def experience_handler(update: Update, context: CallbackContext) -> int:
-    """Отримуємо відповідь про досвід (лише кнопки)."""
-    lang = context.user_data.get("lang", "ua")
-    text = clean_text(update.message.text)
+    lang = get_lang(context)
+    text = (update.message.text or "").strip()
 
-    if is_ua(lang):
-        allowed = ("Так", "Ні")
-        error_text = "Будь ласка, оберіть один із варіантів: «Так» або «Ні» за допомогою кнопок."
-    else:
-        allowed = ("Да", "Нет")
-        error_text = "Пожалуйста, выберите: «Да» или «Нет» с помощью кнопок."
+    allowed_rows = EXP_BUTTONS[lang]
+    allowed = [item for row in allowed_rows for item in row]
 
     if text not in allowed:
-        update.message.reply_text(error_text)
+        kb = ReplyKeyboardMarkup(
+            EXP_BUTTONS[lang], resize_keyboard=True, one_time_keyboard=True
+        )
+        update.message.reply_text(TEXTS["choose_button"][lang], reply_markup=kb)
         return EXPERIENCE
 
     context.user_data["experience"] = text
 
-    # Запис у таблицю
-    append_row(context.user_data)
+    # ---------------- ЗАПИС В ТАБЛИЦЮ ----------------
+    user = update.effective_user
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    user_id = user.id if user else ""
+    username = user.username or "" if user else ""
+    first_name = user.first_name or "" if user else ""
 
-    if is_ua(lang):
-        final_text = (
-            "Дякуємо Вам за реєстрацію! 💛\n\n"
-            "Ми зв'яжемося з Вами у березні, перед запуском школи, "
-            "або раніше — якщо строки зміняться."
-        )
-        again_text = "У разі, якщо Ваша інформація змінилась - Ви можете пройти реєстрацію ще раз, натисніть /start."
-    else:
-        final_text = (
-            "Благодарим Вас за регистрацию! 💛\n\n"
-            "Мы свяжемся с Вами в марте, перед запуском школы, "
-            "или раньше — если сроки изменятся."
-        )
-        again_text = "Если Ваша информация изменилась, Ви можете пройти регестрацию еще раз, нажмите /start."
+    segment = map_segment(text, lang)
+    name = context.user_data.get("name", "")
+    phone = context.user_data.get("phone", "")
+    city = context.user_data.get("city", "")
+    field = context.user_data.get("field", "")
 
-    update.message.reply_text(final_text, reply_markup=ReplyKeyboardRemove())
-    update.message.reply_text(again_text)
+    row = [
+        timestamp,   # A timestamp
+        user_id,     # B user_id
+        username,    # C username
+        first_name,  # D first_name
+        segment,     # E segment
+        name,        # F name
+        phone,       # G phone
+        city,        # H city
+        field,       # I field
+        text,        # J experience (кнопка як є)
+        "telegram",  # K source
+    ]
+
+    try:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.exception(f"Помилка запису в Google Sheets: {e}")
+
+    # фінальне повідомлення
+    update.message.reply_text(
+        TEXTS["final"][lang],
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
     context.user_data.clear()
     return ConversationHandler.END
 
 
 def cancel(update: Update, context: CallbackContext) -> int:
-    """Скасування діалогу."""
-    update.message.reply_text(
-        "Реєстрацію скасовано. Якщо захочете почати знову — натисніть /start.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    lang = get_lang(context)
+    if lang == "uk":
+        update.message.reply_text(
+            "Реєстрацію скасовано. Якщо захочете почати знову — надішліть /start.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        update.message.reply_text(
+            "Регистрация отменена. Если захотите начать снова — отправьте /start.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     context.user_data.clear()
     return ConversationHandler.END
+
+
+# ---------------- MAIN ----------------
 
 
 def main():
@@ -487,16 +558,24 @@ def main():
     updater = Updater(bot=bot, use_context=True)
     dp = updater.dispatcher
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            # чтобы кнопка "Старт"/"Начать" тоже перезапускала бота
+            MessageHandler(
+                Filters.regex(r"^(Старт|Старт )$") | Filters.regex(r"^(Начать|Начать )$"),
+                start,
+            ),
+        ],
         states={
-            WAIT_START: [MessageHandler(Filters.text & ~Filters.command, wait_start)],
-            POLICY: [MessageHandler(Filters.text & ~Filters.command, policy_handler)],
             LANGUAGE: [MessageHandler(Filters.text & ~Filters.command, language_handler)],
+            CONSENT: [MessageHandler(Filters.text & ~Filters.command, consent_handler)],
             NAME: [MessageHandler(Filters.text & ~Filters.command, name_handler)],
-            PHONE: [
-                MessageHandler(Filters.contact, phone_handler),
-                MessageHandler(Filters.text & ~Filters.command, phone_handler),
+            PHONE_METHOD: [
+                MessageHandler(
+                    Filters.contact | (Filters.text & ~Filters.command),
+                    phone_method_handler,
+                )
             ],
             PHONE_MANUAL: [
                 MessageHandler(Filters.text & ~Filters.command, phone_manual_handler)
@@ -511,7 +590,7 @@ def main():
         allow_reentry=True,
     )
 
-    dp.add_handler(conv_handler)
+    dp.add_handler(conv)
 
     logger.info("Bot is starting...")
     updater.start_polling()
